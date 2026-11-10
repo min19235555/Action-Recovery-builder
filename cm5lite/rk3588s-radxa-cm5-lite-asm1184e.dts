@@ -1,0 +1,546 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Radxa CM5 Lite (RK3582 / 4GB LPDDR4X / 32GB eMMC / onboard RTL8211F)
+ * custom carrier board
+ *
+ * This variant targets mainline Linux 6.18 (ImmortalWrt) and therefore
+ * uses the upstream label names, not the Radxa 6.1 BSP ones:
+ *   - usb_host0_xhci    (was usbdrd3_0 / usbdrd_dwc3_0, USB3 OTG0)
+ *   - usb_host2_xhci    (was usbhost3_0 / usbhost_dwc3_0, USB3 host1)
+ *   - usb_host1_ehci/ohci (USB2 companion, u2phy3)
+ *   - dp0_in / vp2_out_dp0 endpoints instead of the vendor route_dp0 node
+ *
+ *            +-------------------------------------------------------+
+ *            |                    Radxa CM5 Lite                    |
+ *            |  RK3582 (RK3588S pin-compatible)                      |
+ *            +-------------------------------------------------------+
+ *              |                |                    |
+ *   GMAC1+RTL8211F      PCIe2.0 x1 (l2)      USB3 host1 (usb_host2_xhci)
+ *              |                |                    |
+ *            RJ45         ASM1184E (1:4)         VL817-Q7 (1:4)
+ *                           /  |  |  \                 / | | \
+ *                   8125B --+  |  |  +-- 8125B      USB3 x4
+ *                              |  |
+ *                     M.2 E-key  M.2 B-key
+ *                       (Wi-Fi)    (5G)
+ *
+ *   USB3.0 OTG0 + USBDP PHY0  ->  Type-C (USB3 + DP alt-mode, FUSB302)
+ *
+ * Board inventory confirmed from the uploaded photos:
+ *   - Radxa CM5 V2.2 module, RK3582 + SK hynix 4GB LPDDR4X, 32GB eMMC
+ *   - 1x LPJG0926HENL MagJack (2.5G-rated, used by the onboard RTL8211F 1G)
+ *   - 4x USB3 Type-A (VL817-Q7), 1x Type-C (TypeC1, USB3 + DP), no HDMI
+ *   - 2x QG2439S LAN transformers + 2x RTL8125B, dual RJ45 on the 5G HAT
+ *   - ROBOX_5GHAT 26B_V2: Fibocom FM160-CN (PCIe 5G) + MT7922 (PCIe Wi-Fi)
+ *   - microSD slot, DC input silkscreen "DC7-24V"
+ *
+ * Notes:
+ *   1. ASM1184E is a standard PCIe bridge. PCIe switches and the devices
+ *      behind them are fully enumerable, therefore NO device tree node is
+ *      required for the switch, the RTL8125B PHYs, the Wi-Fi or the 5G
+ *      module. Only the upstream root complex (pcie2x1l2) is described.
+ *   2. GPIO numbers below are a reference assignment copied from the Radxa
+ *      CM5 IO design. They MUST be changed to match the real carrier
+ *      schematic.
+ *   3. Build (OpenWrt/ImmortalWrt): put this file and
+ *      rk3588s-radxa-cm5.dtsi into
+ *        target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/
+ *      and set DEVICE_DTS := rk3588s-radxa-cm5-lite-asm1184e
+ *      in target/linux/rockchip/image/armv8.mk.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+#include <dt-bindings/soc/rockchip,vop2.h>
+#include <dt-bindings/usb/pd.h>
+#include "rk3588s.dtsi"
+#include "rk3588s-radxa-cm5.dtsi"
+
+/ {
+	model = "Radxa CM5 Lite ASM1184E Carrier";
+	compatible = "radxa,cm5-lite-asm1184e", "radxa,cm5",
+		     "rockchip,rk3582", "rockchip,rk3588s";
+
+	aliases {
+		ethernet0 = &gmac1;
+		mmc0 = &sdhci;
+		mmc1 = &sdmmc;
+	};
+
+	chosen {
+		stdout-path = "serial2:1500000n8";
+	};
+
+	/*
+	 * Power tree
+	 *
+	 * DC input silkscreen is "DC7-24V" (2-pin). It is modelled as a
+	 * fixed 12V nominal source; the on-board buck generates 5V.
+	 */
+	vcc12v_dcin: regulator-vcc12v-dcin {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_dcin";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <12000000>;
+		regulator-max-microvolt = <12000000>;
+	};
+
+	vcc5v0_sys: regulator-vcc5v0-sys {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		vin-supply = <&vcc12v_dcin>;
+	};
+
+	vcc3v3_sys: regulator-vcc3v3-sys {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc3v3_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	/* 3.3V reference used by &gmac1 (phy-supply) on the CM5 module. */
+	vcc_3v3_s0: regulator-vcc-3v3-s0 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_3v3_s0";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc3v3_sys>;
+	};
+
+	/*
+	 * 3.3V rail of ASM1184E + RTL8125B #1/#2 + M.2 E-key/B-key.
+	 *
+	 * Keep this rail alive: a PCIe switch must never lose power while the
+	 * root complex is running. The GPIO only performs the initial power-up
+	 * sequencing, hence "regulator-always-on".
+	 */
+	vcc3v3_pcie: regulator-vcc3v3-pcie {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc3v3_pcie";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpios = <&gpio1 RK_PD3 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&vcc3v3_pcie_en>;
+		enable-active-high;
+		startup-delay-us = <100000>;
+		regulator-boot-on;
+		regulator-always-on;
+		vin-supply = <&vcc3v3_sys>;
+	};
+
+	/* 5V for VL817-Q7 itself (hub core / internal LDOs). */
+	vcc5v0_usb3_hub: regulator-vcc5v0-usb3-hub {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_usb3_hub";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		gpio = <&gpio1 RK_PA0 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&vcc5v0_usb3_hub_en>;
+		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	/*
+	 * VBUS of the four downstream USB3 ports.
+	 * If the board uses per-port load switches, replace this node by four
+	 * GPIO-controlled regulators; the VL817 itself does not expose a DT
+	 * binding for port power.
+	 */
+	vcc5v0_usb3_vbus: regulator-vcc5v0-usb3-vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_usb3_vbus";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		regulator-boot-on;
+		regulator-always-on;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	/* Type-C port VBUS (FUSB302 controls it). */
+	vbus5v0_typec: regulator-vbus5v0-typec {
+		compatible = "regulator-fixed";
+		regulator-name = "vbus5v0_typec";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		gpio = <&gpio0 RK_PD5 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&vbus5v0_typec_en>;
+		enable-active-high;
+		vin-supply = <&vcc5v0_sys>;
+	};
+};
+
+/*
+ * RK3582: no GPU.
+ */
+&gpu {
+	status = "disabled";
+};
+
+/*
+ * Onboard RTL8211F (1x GbE). The PHY, MDIO bus and RGMII delays are
+ * described by rk3588s-radxa-cm5.dtsi; the carrier only adds the RJ45 and
+ * the magnetics, so only the controller has to be enabled here.
+ */
+&gmac1 {
+	status = "okay";
+};
+
+/*
+ * PCIe: pcie2x1l2 (combphy0_ps) -> ASM1184E upstream port
+ *
+ * ASM1184E downstream port map (fixed by the PCIe topology, not by DT):
+ *   port 1 -> RTL8125B #1  (2.5GbE, r8169)
+ *   port 2 -> RTL8125B #2  (2.5GbE, r8169)
+ *   port 3 -> M.2 E-key    (MT7922 Wi-Fi, PCIe Gen2 x1)
+ *   port 4 -> M.2 B-key    (Fibocom FM160-CN 5G)
+ *
+ * FM160-CN supports BOTH PCIe 4.0 and USB3.1/USB2.0. This file assumes
+ * the PCIe variant is wired to ASM1184E port 4. If the board routes USB
+ * instead, port 4 stays empty and the module must be described as a USB
+ * device on the VL817/dedicated USB3 host.
+ *
+ * Bandwidth warning: ASM1184E is PCIe 2.0, upstream 1 lane = 5 GT/s
+ * (~500 MB/s per direction after 8b/10b). Two 2.5GbE ports at full
+ * duplex already need ~625 MB/s per direction, so the four downstream
+ * ports share one oversubscribed uplink. FM160-CN itself is PCIe 4.0 and
+ * will train down to Gen2 x1.
+ *
+ * pcie2x1l2 shares combphy0_ps with sata0, therefore sata0 must stay
+ * disabled (it is disabled by default).
+ */
+&pcie2x1l2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie2x1l2_rst>;
+	reset-gpios = <&gpio3 RK_PD1 GPIO_ACTIVE_HIGH>;
+	vpcie3v3-supply = <&vcc3v3_pcie>;
+	status = "okay";
+};
+
+&combphy0_ps {
+	status = "okay";
+};
+
+/*
+ * USB 3.1 Gen1 hub: VL817-Q7 (4 downstream ports)
+ *
+ * The CM5 connector routes the USB3 host port (USB30_2 / "USB3_HOST1")
+ * together with USB20_HOST1:
+ *   - USB 3.0 part (2109:0817) under usb_host2_xhci (combphy2_psu)
+ *   - USB 2.0 part (2109:2817) under usb_host1_ehci/ohci (u2phy3)
+ * Both nodes are linked through "peer-hub".
+ *
+ * reset-gpios is intentionally only present on the USB2 node: the two
+ * nodes are two platform devices for the same physical chip, and the
+ * kernel gpio consumer API is exclusive, so claiming the same RESET#
+ * GPIO twice would fail. One toggle resets the whole VL817.
+ */
+&usb_host1_ehci {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	hub_2_0: hub@1 {
+		compatible = "usb2109,2817";
+		reg = <1>;
+		vdd-supply = <&vcc5v0_usb3_hub>;
+		peer-hub = <&hub_3_0>;
+		reset-gpios = <&gpio1 RK_PC7 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&usb3_hub_rst>;
+	};
+};
+
+&usb_host1_ohci {
+	status = "okay";
+};
+
+&usb_host2_xhci {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	hub_3_0: hub@1 {
+		compatible = "usb2109,817";
+		reg = <1>;
+		vdd-supply = <&vcc5v0_usb3_hub>;
+		peer-hub = <&hub_2_0>;
+	};
+};
+
+/*
+ * USB2 PHY used as the USB2 companion of the USB3 host port.
+ */
+&u2phy3 {
+	status = "okay";
+};
+
+&u2phy3_host {
+	status = "okay";
+};
+
+&combphy2_psu {
+	status = "okay";
+};
+
+/*
+ * M.2 E-key Wi-Fi: MediaTek MT7922 (MT7922AEA).
+ * PCIe side is enumerated behind ASM1184E; Bluetooth is a USB2 device and
+ * must land on a USB2 host. USB2 host1 is already used by the VL817, OTG0
+ * by Type-C, so host0 is the remaining candidate.
+ * VERIFY on the schematic: if BT is wired to a VL817 downstream port,
+ * delete this block.
+ */
+&u2phy2 {
+	status = "okay";
+};
+
+&u2phy2_host {
+	status = "okay";
+};
+
+&usb_host0_ehci {
+	status = "okay";
+};
+
+&usb_host0_ohci {
+	status = "okay";
+};
+
+/*
+ * Type-C + DP alt-mode
+ */
+&i2c6 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c6m3_xfer>;
+
+	usbc0: usb-typec@22 {
+		compatible = "fcs,fusb302";
+		reg = <0x22>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <RK_PC4 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&usbc0_int>;
+		vbus-supply = <&vbus5v0_typec>;
+		status = "okay";
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C";
+			data-role = "dual";
+			power-role = "dual";
+			try-power-role = "sink";
+			op-sink-microwatt = <1000000>;
+
+			sink-pdos = <PDO_FIXED(5000, 1000, PDO_FIXED_USB_COMM)>;
+			source-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM)>;
+
+			altmodes {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				altmode@0 {
+					reg = <0>;
+					svid = <0xff01>;
+					vdo = <0xffffffff>;
+				};
+			};
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					usbc0_orien_sw: endpoint {
+						remote-endpoint = <&usbdp_phy0_orientation_switch>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+
+					usbc0_role_sw: endpoint {
+						remote-endpoint = <&dwc3_0_role_switch>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+
+					dp_altmode_mux: endpoint {
+						remote-endpoint = <&usbdp_phy0_dp_altmode_mux>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&usbdp_phy0 {
+	status = "okay";
+	mode-switch;
+	orientation-switch;
+	sbu1-dc-gpios = <&gpio3 RK_PC4 GPIO_ACTIVE_HIGH>;
+	sbu2-dc-gpios = <&gpio3 RK_PD4 GPIO_ACTIVE_HIGH>;
+
+	port {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		usbdp_phy0_orientation_switch: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&usbc0_orien_sw>;
+		};
+
+		usbdp_phy0_dp_altmode_mux: endpoint@1 {
+			reg = <1>;
+			remote-endpoint = <&dp_altmode_mux>;
+		};
+	};
+};
+
+&usb_host0_xhci {
+	dr_mode = "otg";
+	usb-role-switch;
+	status = "okay";
+
+	port {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dwc3_0_role_switch: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&usbc0_role_sw>;
+		};
+	};
+};
+
+&u2phy0 {
+	status = "okay";
+};
+
+&u2phy0_otg {
+	status = "okay";
+};
+
+/*
+ * DisplayPort over the Type-C connector. mainline 6.18 has no
+ * "route_dp0" node any more, the VOP2 port is connected through the OF
+ * graph: vp2 -> dp0 -> usbdp_phy0 -> Type-C mux.
+ */
+&dp0 {
+	status = "okay";
+};
+
+&dp0_in {
+	dp0_in_vp2: endpoint {
+		remote-endpoint = <&vp2_out_dp0>;
+	};
+};
+
+&vop {
+	status = "okay";
+};
+
+&vop_mmu {
+	status = "okay";
+};
+
+&vp2 {
+	vp2_out_dp0: endpoint@a {
+		reg = <ROCKCHIP_VOP2_EP_DP0>;
+		remote-endpoint = <&dp0_in_vp2>;
+	};
+};
+
+/*
+ * This carrier has no HDMI, only DP over Type-C.
+ */
+&hdmi0 {
+	status = "disabled";
+};
+
+/*
+ * microSD slot on the carrier (visible on the bottom-side photo).
+ * This is also the boot device of the OpenWrt image.
+ */
+&sdmmc {
+	bus-width = <4>;
+	cap-mmc-highspeed;
+	cap-sd-highspeed;
+	disable-wp;
+	no-sdio;
+	no-mmc;
+	sd-uhs-sdr104;
+	max-frequency = <200000000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc_bus4 &sdmmc_clk &sdmmc_cmd &sdmmc_det>;
+	vmmc-supply = <&vcc_3v3_s3>;
+	vqmmc-supply = <&vccio_sd_s0>;
+	status = "okay";
+};
+
+/*
+ * Serial console (CM5 IO uses uart2m0 at 1500000n8).
+ */
+&uart2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart2m0_xfer>;
+	status = "okay";
+};
+
+/*
+ * Pin mux for the carrier control signals.
+ * Adjust the GPIO numbers to the real schematic.
+ */
+&pinctrl {
+	pcie {
+		pcie2x1l2_rst: pcie2x1l2-rst {
+			rockchip,pins = <3 RK_PD1 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		vcc3v3_pcie_en: vcc3v3-pcie-en {
+			rockchip,pins = <1 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	usb {
+		vcc5v0_usb3_hub_en: vcc5v0-usb3-hub-en {
+			rockchip,pins = <1 RK_PA0 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		usb3_hub_rst: usb3-hub-rst {
+			rockchip,pins = <1 RK_PC7 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	typec {
+		vbus5v0_typec_en: vbus5v0-typec-en {
+			rockchip,pins = <0 RK_PD5 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		usbc0_int: usbc0-int {
+			rockchip,pins = <0 RK_PC4 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+};
